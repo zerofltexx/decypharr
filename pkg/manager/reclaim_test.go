@@ -133,31 +133,36 @@ func TestClassifyReclaim(t *testing.T) {
 }
 
 func TestDeadLinkSetAdd(t *testing.T) {
+	base := t.TempDir()
+	mount := filepath.Join(base, "mount")
+	entry := func(root, name string) string { return filepath.Join(root, "__all__", name) }
+
 	d := &deadLinkSet{
-		known:     map[string]struct{}{"Live.Entry": {}},
-		mountRoot: "/mnt/remote/realdebrid",
+		known:     map[string]struct{}{"live": {}},
+		mountRoot: mount,
 		byArr:     map[string]*deadArrFiles{},
 	}
-	a := &arr.Arr{Name: "sonarr"}
-	f := []arr.ContentFile{{Path: "/media/tv/Show/S01E01.mkv", TargetPath: "S01E01.mkv"}}
+	a := &arr.Arr{Name: "arr"}
+	f := []arr.ContentFile{{Path: filepath.Join(base, "library", "ep.mkv"), TargetPath: "ep.mkv"}}
 
-	d.add(a, "/mnt/remote/realdebrid/__all__/Live.Entry", "Live.Entry", f)  // entry exists
-	d.add(a, "/mnt/local/other/Gone.Entry", "Gone.Entry", f)                // outside the mount
-	d.add(a, "/mnt/remote/realdebridx/__all__/Gone.Entry", "Gone.Entry", f) // prefix lookalike
+	d.add(a, entry(mount, "live"), "live", f)                              // entry exists
+	d.add(a, entry(filepath.Join(base, "elsewhere"), "gone"), "gone", f)   // outside the mount
+	d.add(a, entry(filepath.Join(base, "mount-other"), "gone"), "gone", f) // prefix lookalike
 	if len(d.byArr) != 0 {
 		t.Fatalf("recorded %v, want nothing", d.byArr)
 	}
-	d.add(a, "/mnt/remote/realdebrid/__all__/Gone.Entry", "Gone.Entry", f)
-	g := d.byArr["sonarr"]
-	if g == nil || len(g.files) != 1 || g.links[0].Target != "/mnt/remote/realdebrid/__all__/Gone.Entry/S01E01.mkv" {
+
+	d.add(a, entry(mount, "gone"), "gone", f)
+	g := d.byArr["arr"]
+	if g == nil || len(g.files) != 1 || g.links[0].Target != filepath.Join(entry(mount, "gone"), "ep.mkv") {
 		t.Fatalf("dead link not recorded correctly: %+v", g)
 	}
 
-	empty := &deadLinkSet{known: map[string]struct{}{}, mountRoot: "/mnt/remote/realdebrid", byArr: map[string]*deadArrFiles{}}
-	empty.add(a, "/mnt/remote/realdebrid/__all__/Gone.Entry", "Gone.Entry", f)
+	empty := &deadLinkSet{known: map[string]struct{}{}, mountRoot: mount, byArr: map[string]*deadArrFiles{}}
+	empty.add(a, entry(mount, "gone"), "gone", f)
 	if len(empty.byArr) != 0 {
 		t.Fatal("an empty store must never yield dead links")
 	}
 	var nilSet *deadLinkSet
-	nilSet.add(a, "/x", "x", f) // must not panic
+	nilSet.add(a, entry(mount, "gone"), "gone", f) // must not panic
 }
