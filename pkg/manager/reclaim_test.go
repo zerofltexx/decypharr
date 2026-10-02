@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -129,4 +130,34 @@ func TestClassifyReclaim(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeadLinkSetAdd(t *testing.T) {
+	d := &deadLinkSet{
+		known:     map[string]struct{}{"Live.Entry": {}},
+		mountRoot: "/mnt/remote/realdebrid",
+		byArr:     map[string]*deadArrFiles{},
+	}
+	a := &arr.Arr{Name: "sonarr"}
+	f := []arr.ContentFile{{Path: "/media/tv/Show/S01E01.mkv", TargetPath: "S01E01.mkv"}}
+
+	d.add(a, "/mnt/remote/realdebrid/__all__/Live.Entry", "Live.Entry", f)  // entry exists
+	d.add(a, "/mnt/local/other/Gone.Entry", "Gone.Entry", f)                // outside the mount
+	d.add(a, "/mnt/remote/realdebridx/__all__/Gone.Entry", "Gone.Entry", f) // prefix lookalike
+	if len(d.byArr) != 0 {
+		t.Fatalf("recorded %v, want nothing", d.byArr)
+	}
+	d.add(a, "/mnt/remote/realdebrid/__all__/Gone.Entry", "Gone.Entry", f)
+	g := d.byArr["sonarr"]
+	if g == nil || len(g.files) != 1 || g.links[0].Target != "/mnt/remote/realdebrid/__all__/Gone.Entry/S01E01.mkv" {
+		t.Fatalf("dead link not recorded correctly: %+v", g)
+	}
+
+	empty := &deadLinkSet{known: map[string]struct{}{}, mountRoot: "/mnt/remote/realdebrid", byArr: map[string]*deadArrFiles{}}
+	empty.add(a, "/mnt/remote/realdebrid/__all__/Gone.Entry", "Gone.Entry", f)
+	if len(empty.byArr) != 0 {
+		t.Fatal("an empty store must never yield dead links")
+	}
+	var nilSet *deadLinkSet
+	nilSet.add(a, "/x", "x", f) // must not panic
 }

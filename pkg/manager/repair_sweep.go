@@ -688,6 +688,27 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 // API calls fine, and the actual search/grab work is paced by the Arr's own
 // command queue regardless of how the calls arrive.
 func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile) bool {
+	if err := r.reacquireArrFiles(ctx, a, files); err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
+		statsMu.Lock()
+		run.Stats.RepairFailed += len(files)
+		r.saveRun(run)
+		statsMu.Unlock()
+		return false
+	}
+	statsMu.Lock()
+	run.Stats.Repaired += len(files)
+	r.saveRun(run)
+	statsMu.Unlock()
+	return true
+}
+
+// reacquireArrFiles deletes the Arr's file records and gets the media
+// re-grabbed: blocklisting the original grab where history has one, an
+// explicit search otherwise.
+func (r *Repair) reacquireArrFiles(ctx context.Context, a *arr.Arr, files []arr.ContentFile) error {
 	// Look up the grab history per broken file. Files whose grab record exists
 	// get blocklisted via MarkHistoryFailed (which Sonarr/Radarr auto-re-searches
 	// when "Redownload Failed" is on — the default). Files with no grab record
@@ -699,7 +720,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	needSearch := make([]arr.ContentFile, 0)
 	for _, f := range files {
 		if ctx != nil && ctx.Err() != nil {
-			return false
+			return ctx.Err()
 		}
 		var mediaID int
 		switch a.Type {
@@ -724,11 +745,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// rejected by upgrade-only quality logic.
 	if err := a.DeleteFiles(ctx, files); err != nil {
 		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: DeleteFiles failed")
-		statsMu.Lock()
-		run.Stats.RepairFailed += len(files)
-		r.saveRun(run)
-		statsMu.Unlock()
-		return false
+		return err
 	}
 
 	// Blocklist each unique grab. Errors here are non-fatal: a missing blocklist
@@ -751,12 +768,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: SearchMissing fallback failed")
 		}
 	}
-
-	statsMu.Lock()
-	run.Stats.Repaired += len(files)
-	r.saveRun(run)
-	statsMu.Unlock()
-	return true
+	return nil
 }
 
 // finalizeEntryRepair stamps LastRepairAt and, when the entry is fully broken
@@ -891,6 +903,7 @@ func (r *Repair) enumerateManagedCandidates(ctx context.Context) (map[string]*ca
 func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairConfig) (map[string]*candidate, error) {
 	out := make(map[string]*candidate)
 	var mu sync.Mutex
+	dead := newDeadLinkSet(r.manager.storage.GetEntryItems())
 
 	arrs := r.eligibleArrs(cfg.Arrs)
 	if len(arrs) == 0 {
@@ -900,12 +913,13 @@ func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairCo
 	g, gctx := errgroup.WithContext(ctx)
 	for _, a := range arrs {
 		g.Go(func() error {
-			sub, err := r.collectArrMediaCandidates(gctx, a, "")
+			sub, err := r.collectArrMediaCandidatesWithDead(gctx, a, "", dead)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return err
 				}
 				r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Sweep: GetMedia failed; skipping arr")
+				dead.markIncomplete()
 				return nil
 			}
 			mu.Lock()
@@ -917,12 +931,20 @@ func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairCo
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	r.setDeadLinks(dead)
 	return out, nil
 }
 
 // collectArrMediaCandidates resolves an Arr's media (or a specific media-id
 // within that Arr) to entry-keyed candidates.
 func (r *Repair) collectArrMediaCandidates(ctx context.Context, a *arr.Arr, mediaID string) (map[string]*candidate, error) {
+	return r.collectArrMediaCandidatesWithDead(ctx, a, mediaID, nil)
+}
+
+// collectArrMediaCandidatesWithDead is collectArrMediaCandidates that also
+// records, in dead (when non-nil), Arr files whose symlink points into the
+// mount at an entry that no longer exists.
+func (r *Repair) collectArrMediaCandidatesWithDead(ctx context.Context, a *arr.Arr, mediaID string, dead *deadLinkSet) (map[string]*candidate, error) {
 	out := make(map[string]*candidate)
 	media, err := a.GetMedia(ctx, mediaID)
 	if err != nil {
@@ -939,6 +961,7 @@ func (r *Repair) collectArrMediaCandidates(ctx context.Context, a *arr.Arr, medi
 			name := filepath.Clean(filepath.Base(entryPath))
 			item, err := r.manager.GetEntryItem(name)
 			if err != nil || item == nil {
+				dead.add(a, entryPath, name, files)
 				continue
 			}
 			c, ok := out[name]

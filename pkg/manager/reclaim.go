@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/pkg/arr"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -74,6 +75,14 @@ type ReclaimReport struct {
 	SkippedYoung      int `json:"skipped_young"`
 	SkippedAction     int `json:"skipped_action"`
 
+	// Dead links: Arr files whose symlink points into the mount at an entry
+	// that no longer exists (found by the sweep's Arr scan). They are deleted
+	// in the Arr and re-acquired, through the same path as broken-file repair.
+	DeadLinks         []DeadLink `json:"dead_links"`
+	DeadLinksAborted  string     `json:"dead_links_aborted,omitempty"`
+	DeadLinksRepaired int        `json:"dead_links_repaired"`
+	DeadLinksFailed   int        `json:"dead_links_failed"`
+
 	Reclaimable      []ReclaimItem  `json:"reclaimable"`
 	ReclaimableBytes int64          `json:"reclaimable_bytes"`
 	ByCategory       map[string]int `json:"by_category"`
@@ -88,6 +97,88 @@ type reclaimState struct {
 	running sync.Mutex
 	mu      sync.RWMutex
 	last    *ReclaimReport
+	dead    *deadLinkSet // from the most recent Arr-source sweep
+}
+
+// DeadLink is one Arr file whose symlink target entry is gone.
+type DeadLink struct {
+	Arr    string `json:"arr"`
+	Path   string `json:"path"`
+	Target string `json:"target"`
+}
+
+// deadLinkSet collects dead links during a sweep's Arr enumeration.
+type deadLinkSet struct {
+	mu         sync.Mutex
+	known      map[string]struct{} // entry folder names in the store
+	mountRoot  string
+	incomplete bool // an Arr listing failed: the set may be partial
+	collected  time.Time
+	byArr      map[string]*deadArrFiles
+}
+
+type deadArrFiles struct {
+	arr   *arr.Arr
+	files []arr.ContentFile
+	links []DeadLink
+}
+
+// deadLinkMaxAge bounds how stale a sweep's dead-link set may be when a
+// manual reclaim run acts on it.
+const deadLinkMaxAge = 6 * time.Hour
+
+func newDeadLinkSet(known map[string]struct{}) *deadLinkSet {
+	return &deadLinkSet{
+		known:     known,
+		mountRoot: filepath.Clean(config.Get().Mount.MountPath),
+		collected: time.Now(),
+		byArr:     make(map[string]*deadArrFiles),
+	}
+}
+
+func (d *deadLinkSet) markIncomplete() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.incomplete = true
+	d.mu.Unlock()
+}
+
+// add records files whose resolved entry folder (entryPath) has no entry.
+// Targets outside the mount are ignored: they are not ours to judge.
+func (d *deadLinkSet) add(a *arr.Arr, entryPath, name string, files []arr.ContentFile) {
+	if d == nil || len(d.known) == 0 || d.mountRoot == "" || d.mountRoot == "." {
+		return
+	}
+	if _, ok := d.known[name]; ok {
+		return // the entry exists; the lookup failed for another reason
+	}
+	if !isUnder(entryPath, d.mountRoot) {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	g, ok := d.byArr[a.Name]
+	if !ok {
+		g = &deadArrFiles{arr: a}
+		d.byArr[a.Name] = g
+	}
+	for _, f := range files {
+		g.files = append(g.files, f)
+		g.links = append(g.links, DeadLink{Arr: a.Name, Path: f.Path, Target: filepath.Join(entryPath, f.TargetPath)})
+	}
+}
+
+func isUnder(path, root string) bool {
+	path = filepath.Clean(path)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func (r *Repair) setDeadLinks(d *deadLinkSet) {
+	r.reclaim.mu.Lock()
+	r.reclaim.dead = d
+	r.reclaim.mu.Unlock()
 }
 
 // LastReclaimReport returns the most recent reclaim report, or nil.
@@ -106,7 +197,9 @@ func (r *Repair) RunReclaim(ctx context.Context, dryRun bool) (*ReclaimReport, e
 	defer r.reclaim.running.Unlock()
 
 	cfg := r.cfg().Reclaim
-	report := r.runReclaim(ctx, cfg, r.reclaimCategories(cfg), dryRun || !cfg.Delete)
+	dry := dryRun || !cfg.Delete
+	report := r.runReclaim(ctx, cfg, r.reclaimCategories(cfg), dry)
+	r.repairDeadLinks(ctx, cfg, report, dry)
 
 	r.reclaim.mu.Lock()
 	r.reclaim.last = report
@@ -273,6 +366,84 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 		r.manager.RefreshEntries(true)
 	}
 	return report
+}
+
+// repairDeadLinks acts on the dead links the last sweep found: each Arr's
+// file records are deleted and the media re-acquired. A partial Arr listing,
+// a stale set, or more than MaxPerRun links skips the step.
+func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool) {
+	r.reclaim.mu.Lock()
+	d := r.reclaim.dead
+	if !dryRun {
+		r.reclaim.dead = nil // act on a set at most once
+	}
+	r.reclaim.mu.Unlock()
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	report.DeadLinks = []DeadLink{}
+	names := make([]string, 0, len(d.byArr))
+	for name, g := range d.byArr {
+		names = append(names, name)
+		report.DeadLinks = append(report.DeadLinks, g.links...)
+	}
+	sort.Strings(names)
+	log := r.logger.With().Str("pass", "reclaim").Logger()
+
+	switch {
+	case d.incomplete:
+		report.DeadLinksAborted = "an Arr listing failed during the sweep"
+	case time.Since(d.collected) > deadLinkMaxAge:
+		report.DeadLinksAborted = "dead-link set is older than " + deadLinkMaxAge.String() + "; wait for the next sweep"
+	case len(report.DeadLinks) > cfg.MaxPerRun:
+		report.DeadLinksAborted = fmt.Sprintf("%d dead links exceeds max_per_run %d", len(report.DeadLinks), cfg.MaxPerRun)
+	}
+	if report.DeadLinksAborted != "" {
+		log.Warn().Str("reason", report.DeadLinksAborted).Int("dead_links", len(report.DeadLinks)).Msg("Reclaim: dead links skipped")
+		return
+	}
+	if dryRun {
+		for _, l := range report.DeadLinks {
+			log.Info().Str("arr", l.Arr).Str("path", l.Path).Msg("Reclaim: would re-acquire dead link")
+		}
+		return
+	}
+	for _, name := range names {
+		if ctx.Err() != nil {
+			return
+		}
+		g := d.byArr[name]
+		files := r.stillDead(g)
+		if len(files) == 0 {
+			continue
+		}
+		if err := r.reacquireArrFiles(ctx, g.arr, files); err != nil {
+			report.DeadLinksFailed += len(files)
+			continue
+		}
+		report.DeadLinksRepaired += len(files)
+		log.Info().Str("arr", name).Int("files", len(files)).Msg("Reclaim: dead links re-acquired")
+	}
+}
+
+// stillDead re-checks each file just before acting: the symlink must still
+// point at the same target, and that target's entry must still be missing.
+func (r *Repair) stillDead(g *deadArrFiles) []arr.ContentFile {
+	out := make([]arr.ContentFile, 0, len(g.files))
+	for i, f := range g.files {
+		target := readSymlinkTarget(f.Path)
+		if target == "" || filepath.Clean(target) != filepath.Clean(g.links[i].Target) {
+			continue
+		}
+		if item, err := r.manager.GetEntryItem(filepath.Base(filepath.Dir(target))); err == nil && item != nil {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 // adoptLinked tags the given out-of-scope entries with ReclaimTag. Writes
