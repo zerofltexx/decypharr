@@ -114,6 +114,41 @@ If a full repair sweep would take 2 days at 9 hours/day but `recheck_interval` i
 - **`arr`** — walks Sonarr / Radarr media, resolves each item to an entry through the symlink target, and probes that entry. Broken files are enriched with Arr identifiers so repair can call `DeleteFiles` + `SearchMissing` directly.
 - **`managed`** — walks managed entries directly. Used when you don't have an Arr in front, or for entries imported outside the Arr flow. NZB-only managed brokens have no Arr re-acquire path; they stay `broken` with `failure_reason=usenet_segment_missing` for you to react to manually.
 
+## Reclaim unreferenced entries
+
+When an Arr upgrades or deletes a file it removes the symlink, but the entry it pointed into stays on your debrid account. The reclaim pass removes those entries. It runs after every completed sweep, and on demand through the API.
+
+```json
+{
+  "repair": {
+    "reclaim": {
+      "enabled": true,
+      "delete": false,
+      "library_paths": ["/media/movies", "/media/tv"],
+      "min_age": "24h",
+      "max_per_run": 200
+    }
+  }
+}
+```
+
+| Key             | Meaning                                                                                                   | Default            |
+|-----------------|-----------------------------------------------------------------------------------------------------------|--------------------|
+| `enabled`       | Run the pass after each completed sweep.                                                                  | `false`            |
+| `delete`        | Actually remove entries. When `false` the pass only reports what it would remove.                        | `false`            |
+| `library_paths` | Folders holding your Arrs' symlinks. Each must exist and contain symlinks, or the pass aborts.            | —                  |
+| `min_age`       | How long an entry must have been complete or imported before it can be reclaimed.                         | `24h`              |
+| `max_per_run`   | If more entries than this would be removed, the pass aborts and removes nothing.                          | `200`              |
+| `categories`    | Categories in scope.                                                                                      | every Arr's name   |
+
+How it decides:
+
+- The pass walks `library_paths` and records the entry folder each symlink points into. An entry is reclaimable when nothing links into its folder. One link (even a broken one) keeps the whole entry.
+- Only entries whose category is in scope are considered. Entries without a category, such as torrents you added to the account yourself, are never touched. The exception is an uncategorised entry the library is seen linking to: it is tagged `reclaim:linked` and is in scope from then on. Tagging happens in report-only mode too, so it is in place before you turn `delete` on.
+- Entries that are still queued, downloading, incomplete, marked bad, imported with a non-symlink action, or active within `min_age` are kept.
+
+Start with `delete: false`, check the report (`GET /api/repair/reclaim`), then turn `delete` on. If the first real run has more candidates than `max_per_run`, review the report and raise the limit for that run.
+
 ## Workflow
 
 1. The cron tick (or a manual **Run Now**) opens a new run.
@@ -151,6 +186,8 @@ A failure to persist a single entry's health update is logged but never aborts t
 | `GET`    | `/api/repair/health/{name}`           | Per-entry health, including the broken-file list.                        |
 | `POST`   | `/api/repair/health/{name}/check`     | Force-recheck this entry.                                                |
 | `POST`   | `/api/repair/recheck/media`           | Recheck a single Arr media item. Body: `{arr, media_id, fix}`. Repairs run through Arr. |
+| `GET`    | `/api/repair/reclaim`                 | Last reclaim report.                                                     |
+| `POST`   | `/api/repair/reclaim`                 | Run a reclaim pass now. Report-only unless `?dry_run=false` and `reclaim.delete` is on. |
 
 ### Examples
 
