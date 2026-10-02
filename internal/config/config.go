@@ -240,12 +240,47 @@ type RepairConfig struct {
 	// fires mid-repair-sweep, AutoRepair decides what happens to whatever was
 	// already found broken: repaired if true, left alone if false.
 	StopSchedule string `json:"stop_schedule,omitempty"`
+
+	// Reclaim removes debrid entries that no library symlink points at any more
+	// (the Arr deleted or upgraded the file). It runs at the end of each sweep.
+	Reclaim ReclaimConfig `json:"reclaim,omitempty"`
+}
+
+// ReclaimConfig controls the post-sweep reclaim pass. Only entries added on
+// behalf of an Arr (their category is an Arr name) are ever considered, so
+// torrents added to the debrid account by other means are never touched.
+type ReclaimConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Delete makes the pass actually remove entries. When false (the default)
+	// it only reports what it would remove.
+	Delete bool `json:"delete,omitempty"`
+
+	// LibraryPaths are the folders holding the Arrs' symlinks (e.g. the movie
+	// and TV roots). Every one must exist and be readable, or the pass aborts.
+	LibraryPaths []string `json:"library_paths,omitempty"`
+
+	// MinAge is how long an entry must have been complete before it can be
+	// reclaimed, so a finished download the Arr has not imported yet is safe.
+	MinAge string `json:"min_age,omitempty"`
+
+	// MaxPerRun aborts the pass, deleting nothing, when more entries than this
+	// would be removed. A sudden spike usually means a library path is wrong.
+	MaxPerRun int `json:"max_per_run,omitempty"`
+
+	// Categories limits the pass to these categories. Empty means every
+	// configured Arr's name.
+	Categories []string `json:"categories,omitempty"`
+}
+
+func (r ReclaimConfig) IsZero() bool {
+	return !r.Enabled && !r.Delete && len(r.LibraryPaths) == 0 && r.MinAge == "" && r.MaxPerRun == 0 && len(r.Categories) == 0
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == ""
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.Reclaim.IsZero()
 }
 
 type Config struct {
@@ -713,6 +748,12 @@ func (c *Config) applyRepairDefaults() {
 
 	if c.Repair.NNTPConnectionPercent == 0 {
 		c.Repair.NNTPConnectionPercent = 20
+	}
+	if c.Repair.Reclaim.MinAge == "" {
+		c.Repair.Reclaim.MinAge = "24h"
+	}
+	if c.Repair.Reclaim.MaxPerRun <= 0 {
+		c.Repair.Reclaim.MaxPerRun = 200
 	}
 }
 

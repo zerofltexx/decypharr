@@ -161,6 +161,8 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("repaired", run.Stats.Repaired).
 		Int("repair_failed", run.Stats.RepairFailed).
 		Msg("Sweep: completed")
+
+	r.reclaimAfterSweep(ctx)
 }
 
 // finishCancelledRepairSweep is reached whenever the repair sweep's context is cancelled

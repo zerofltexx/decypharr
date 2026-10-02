@@ -83,6 +83,8 @@ type Repair struct {
 	stopScheduled  bool
 	activeStopFunc func() // called by the stop job for the active run
 	runWG          sync.WaitGroup
+
+	reclaim reclaimState
 }
 
 // NewRepair builds the repair service for the given manager. Call

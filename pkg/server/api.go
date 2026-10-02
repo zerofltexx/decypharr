@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -768,6 +769,27 @@ func (s *Server) handleListRepairRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	utils.JSONResponse(w, runs, http.StatusOK)
+}
+
+// handleGetReclaim returns the most recent reclaim report (null if none yet).
+func (s *Server) handleGetReclaim(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, s.manager.Repair().LastReclaimReport(), http.StatusOK)
+}
+
+// handleRunReclaim runs a reclaim pass now. It is a dry run unless
+// ?dry_run=false is passed and reclaim deletion is enabled in config.
+func (s *Server) handleRunReclaim(w http.ResponseWriter, r *http.Request) {
+	dryRun := r.URL.Query().Get("dry_run") != "false"
+	report, err := s.manager.Repair().RunReclaim(r.Context(), dryRun)
+	if errors.Is(err, manager.ErrReclaimRunning) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, report, http.StatusOK)
 }
 
 func (s *Server) handleGetRepairRun(w http.ResponseWriter, r *http.Request) {

@@ -64,6 +64,8 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/repair/health", s.handleListEntryHealth)
 			r.Get("/repair/health/{name}", s.handleGetEntryHealth)
 			r.Post("/repair/health/{name}/check", s.handleRecheckEntry)
+			r.Get("/repair/reclaim", s.handleGetReclaim)
+			r.Post("/repair/reclaim", s.handleRunReclaim)
 
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
