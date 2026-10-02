@@ -144,7 +144,7 @@ When an Arr upgrades or deletes a file it removes the symlink, but the entry it 
 How it decides:
 
 - The pass walks `library_paths` and records the entry folder each symlink points into. An entry is reclaimable when nothing links into its folder. One link (even a broken one) keeps the whole entry.
-- Only entries whose category is in scope are considered. Entries without a category, such as torrents you added to the account yourself, are never touched. The exception is an uncategorised entry the library is seen linking to: it is tagged `reclaim:linked` and is in scope from then on. Tagging happens in report-only mode too, so it is in place before you turn `delete` on.
+- Only entries whose category is in scope are considered, so torrents you added to the account yourself are never touched. The exception is an out-of-scope entry the library is seen linking to (for example one with no category, or the old category of a renamed Arr): it is tagged `reclaim:linked` and is in scope from then on. Tagging happens in report-only mode too, so it is in place before you turn `delete` on.
 - Entries that are still queued, downloading, incomplete, marked bad, imported with a non-symlink action, or active within `min_age` are kept.
 
 Start with `delete: false`, check the report (`GET /api/repair/reclaim`), then turn `delete` on. If the first real run has more candidates than `max_per_run`, review the report and raise the limit for that run.

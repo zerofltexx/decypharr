@@ -27,11 +27,11 @@ import (
 //
 // It is deliberately conservative:
 //   - only entries whose category is an Arr name are considered, so torrents
-//     added to the debrid account by hand are never touched. Entries with no
-//     category (older imports, or ones synced from the account before their
-//     category was recorded) are adopted once the library is seen linking
-//     to them: they get the ReclaimTag and are in scope from then on. An
-//     unlinked torrent without a category is never adopted;
+//     added to the debrid account by hand are never touched. Entries outside
+//     that scope (no category because the account sync recorded them first,
+//     or a renamed Arr's old category) are adopted once the library is seen
+//     linking to them: they get the ReclaimTag and are in scope from then on.
+//     An out-of-scope entry the library never links to is never adopted;
 //   - entries still in the download queue, still downloading, not complete,
 //     younger than MinAge, or imported with a non-symlink action are skipped;
 //   - one link into an entry's folder protects the whole entry;
@@ -39,7 +39,7 @@ import (
 //   - more than MaxPerRun reclaimable entries aborts the pass;
 //   - with Delete off (the default) nothing is removed, only reported.
 
-// ReclaimTag marks an uncategorised entry the library has been seen linking
+// ReclaimTag marks an out-of-scope entry the library has been seen linking
 // to, which makes it eligible for reclaim once those links are gone.
 const ReclaimTag = "reclaim:linked"
 
@@ -66,7 +66,7 @@ type ReclaimReport struct {
 	Symlinks      int `json:"symlinks"`       // symlinks found under the library paths
 	LinkedFolders int `json:"linked_folders"` // distinct entry folders they point into
 
-	Adopted           int `json:"adopted"`    // uncategorised linked entries tagged this pass
+	Adopted           int `json:"adopted"`    // out-of-scope linked entries tagged this pass
 	Considered        int `json:"considered"` // in-scope entries examined
 	Referenced        int `json:"referenced"`
 	SkippedQueued     int `json:"skipped_queued"`
@@ -189,10 +189,8 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 			return err
 		}
 		if _, ok := scope[e.Category]; !ok && !slices.Contains(e.Tags, ReclaimTag) {
-			if e.Category == "" {
-				if _, linkedNow := linked[e.GetFolder()]; linkedNow {
-					adopt = append(adopt, e.InfoHash)
-				}
+			if _, linkedNow := linked[e.GetFolder()]; linkedNow {
+				adopt = append(adopt, e.InfoHash)
 			}
 			return nil
 		}
@@ -277,7 +275,7 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 	return report
 }
 
-// adoptLinked tags the given uncategorised entries with ReclaimTag. Writes
+// adoptLinked tags the given out-of-scope entries with ReclaimTag. Writes
 // happen after the store walk, never during it.
 func (r *Repair) adoptLinked(hashes []string) int {
 	n := 0
