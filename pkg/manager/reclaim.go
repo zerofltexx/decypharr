@@ -141,6 +141,7 @@ type deadLinkSet struct {
 	incomplete bool // an Arr listing failed: the set may be partial
 	collected  time.Time
 	byArr      map[string]*deadArrFiles
+	arrPaths   map[string]struct{} // every library path an Arr has a file record for
 }
 
 type deadArrFiles struct {
@@ -159,6 +160,28 @@ func newDeadLinkSet(known map[string]struct{}) *deadLinkSet {
 		mountRoot: filepath.Clean(config.Get().Mount.MountPath),
 		collected: time.Now(),
 		byArr:     make(map[string]*deadArrFiles),
+		arrPaths:  make(map[string]struct{}),
+	}
+}
+
+// listableArr reports whether the Arr's media can be enumerated (GetMedia and
+// MediaFolders only know Sonarr's and Radarr's APIs).
+func listableArr(a *arr.Arr) bool {
+	return a != nil && (a.Type == arr.Sonarr || a.Type == arr.Radarr)
+}
+
+// recordArrFiles notes library paths an Arr tracks, so orphan handling never
+// treats them as untracked.
+func (d *deadLinkSet) recordArrFiles(files []arr.ContentFile) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, f := range files {
+		if f.Path != "" {
+			d.arrPaths[filepath.Clean(f.Path)] = struct{}{}
+		}
 	}
 }
 
@@ -222,17 +245,24 @@ func (r *Repair) RunReclaim(ctx context.Context, dryRun bool) (*ReclaimReport, e
 	}
 	defer r.reclaim.running.Unlock()
 
+	return r.reclaimPass(ctx, dryRun, false), nil
+}
+
+// reclaimPass runs one pass; the caller holds reclaim.running. afterSweep
+// means the sweep that built the dead-link set has just completed, so its age
+// is not checked (a long probe phase must not make it look stale).
+func (r *Repair) reclaimPass(ctx context.Context, dryRun, afterSweep bool) *ReclaimReport {
 	cfg := r.cfg().Reclaim
 	dry := dryRun || !cfg.Delete
 	report := r.runReclaim(ctx, cfg, r.reclaimCategories(cfg), dry)
 	d := r.takeDeadLinks(dry)
-	r.repairDeadLinks(ctx, cfg, report, dry, d)
-	r.handleOrphans(ctx, cfg, report, dry, d)
+	r.repairDeadLinks(ctx, cfg, report, dry, d, afterSweep)
+	r.handleOrphans(ctx, cfg, report, dry, d, afterSweep)
 
 	r.reclaim.mu.Lock()
 	r.reclaim.last = report
 	r.reclaim.mu.Unlock()
-	return report, nil
+	return report
 }
 
 // reclaimAfterSweep is called once a scheduled sweep has completed.
@@ -240,9 +270,12 @@ func (r *Repair) reclaimAfterSweep(ctx context.Context) {
 	if !r.cfg().Reclaim.Enabled {
 		return
 	}
-	if _, err := r.RunReclaim(ctx, false); err != nil {
-		r.logger.Warn().Err(err).Msg("Reclaim: skipped")
+	if !r.reclaim.running.TryLock() {
+		r.logger.Warn().Err(ErrReclaimRunning).Msg("Reclaim: skipped")
+		return
 	}
+	defer r.reclaim.running.Unlock()
+	r.reclaimPass(ctx, false, true)
 }
 
 func (r *Repair) reclaimCategories(cfg config.ReclaimConfig) []string {
@@ -250,8 +283,11 @@ func (r *Repair) reclaimCategories(cfg config.ReclaimConfig) []string {
 	if len(cfg.Categories) > 0 {
 		names = cfg.Categories
 	} else {
-		for _, a := range r.manager.arr.GetAll() {
-			if a != nil {
+		// Default to the Arrs the repair sweep scans (Sonarr/Radarr only). Every
+		// other configured Arr (e.g. Lidarr) keeps its library elsewhere, outside
+		// library_paths, so its entries would all look unreferenced.
+		for _, a := range r.eligibleArrs(r.cfg().Arrs) {
+			if listableArr(a) {
 				names = append(names, a.Name)
 			}
 		}
@@ -412,7 +448,7 @@ func (r *Repair) takeDeadLinks(dryRun bool) *deadLinkSet {
 // repairDeadLinks acts on the dead links the last sweep found: each Arr's
 // file records are deleted and the media re-acquired. A partial Arr listing,
 // a stale set, or more than MaxPerRun links skips the step.
-func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet) {
+func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet, afterSweep bool) {
 	if d == nil {
 		return
 	}
@@ -431,7 +467,7 @@ func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, 
 	switch {
 	case d.incomplete:
 		report.DeadLinksAborted = "an Arr listing failed during the sweep"
-	case time.Since(d.collected) > deadLinkMaxAge:
+	case !afterSweep && time.Since(d.collected) > deadLinkMaxAge:
 		report.DeadLinksAborted = "dead-link set is older than " + deadLinkMaxAge.String() + "; wait for the next sweep"
 	case len(report.DeadLinks) > cfg.MaxPerRun:
 		report.DeadLinksAborted = fmt.Sprintf("%d dead links exceeds max_per_run %d", len(report.DeadLinks), cfg.MaxPerRun)
@@ -512,7 +548,14 @@ func (r *Repair) reclaimEntry(infoHash string) error {
 	if err != nil {
 		return err
 	}
-	r.manager.RemoveTorrentPlacements(e)
+	// Remove from each provider first and stop on the first failure: deleting
+	// the store entry while the torrent survives on the account would leak it
+	// (the account sync re-adds it without a category, out of reclaim's scope).
+	for _, placement := range e.Providers {
+		if err := r.manager.RemoveFromProvider(placement); err != nil {
+			return fmt.Errorf("remove from %s: %w", placement.Provider, err)
+		}
+	}
 	return r.manager.storage.Delete(infoHash)
 }
 
@@ -694,7 +737,7 @@ func seasonOf(path string) (int, bool) {
 // Arr to search for the movie or season, so the media is re-acquired instead
 // of staying missing. Links the dead-link step owns are excluded. It needs the
 // same fresh, complete sweep as dead-link repair, and honours MaxPerRun.
-func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet) {
+func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet, afterSweep bool) {
 	report.OrphanLinks = []OrphanLink{}
 	if len(report.orphans) == 0 {
 		return
@@ -705,17 +748,17 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 		report.OrphansAborted = "no Arr-source sweep since start; orphans are handled right after one"
 	case d.incomplete:
 		report.OrphansAborted = "an Arr listing failed during the sweep"
-	case time.Since(d.collected) > deadLinkMaxAge:
+	case !afterSweep && time.Since(d.collected) > deadLinkMaxAge:
 		report.OrphansAborted = "sweep data is older than " + deadLinkMaxAge.String()
 	}
 
+	// Any path an Arr had a file record for at enumeration is not an orphan,
+	// even if its entry vanished since (that is next sweep's dead link).
 	owned := make(map[string]struct{})
 	if d != nil {
 		d.mu.Lock()
-		for _, g := range d.byArr {
-			for _, l := range g.links {
-				owned[filepath.Clean(l.Path)] = struct{}{}
-			}
+		for p := range d.arrPaths {
+			owned[p] = struct{}{}
 		}
 		d.mu.Unlock()
 	}
@@ -727,6 +770,9 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 	var owners []owner
 	if report.OrphansAborted == "" {
 		for _, a := range r.eligibleArrs(r.cfg().Arrs) {
+			if !listableArr(a) {
+				continue
+			}
 			folders, err := a.MediaFolders(ctx)
 			if err != nil {
 				report.OrphansAborted = fmt.Sprintf("listing %s media folders: %v", a.Name, err)

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -780,7 +781,9 @@ func (s *Server) handleGetReclaim(w http.ResponseWriter, r *http.Request) {
 // ?dry_run=false is passed and reclaim deletion is enabled in config.
 func (s *Server) handleRunReclaim(w http.ResponseWriter, r *http.Request) {
 	dryRun := r.URL.Query().Get("dry_run") != "false"
-	report, err := s.manager.Repair().RunReclaim(r.Context(), dryRun)
+	// Detached from the request: a client disconnect must not cancel a deleting
+	// pass after it has consumed the sweep's dead-link set.
+	report, err := s.manager.Repair().RunReclaim(context.WithoutCancel(r.Context()), dryRun)
 	if errors.Is(err, manager.ErrReclaimRunning) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return

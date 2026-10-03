@@ -216,3 +216,29 @@ func TestSeasonOf(t *testing.T) {
 		}
 	}
 }
+
+func TestListableArr(t *testing.T) {
+	for _, c := range []struct {
+		typ  arr.Type
+		want bool
+	}{{arr.Sonarr, true}, {arr.Radarr, true}, {arr.Lidarr, false}, {arr.Readarr, false}, {arr.Others, false}} {
+		if got := listableArr(&arr.Arr{Type: c.typ}); got != c.want {
+			t.Errorf("listableArr(%s) = %v, want %v", c.typ, got, c.want)
+		}
+	}
+	if listableArr(nil) {
+		t.Error("nil Arr must not be listable")
+	}
+}
+
+func TestRecordArrFiles(t *testing.T) {
+	base := t.TempDir()
+	d := &deadLinkSet{arrPaths: map[string]struct{}{}}
+	ep := filepath.Join(base, "Show", "Season 01", "ep.mkv")
+	d.recordArrFiles([]arr.ContentFile{{Path: ep}, {Path: ""}})
+	if _, ok := d.arrPaths[ep]; !ok || len(d.arrPaths) != 1 {
+		t.Fatalf("arrPaths = %v, want only %s", d.arrPaths, ep)
+	}
+	var nilSet *deadLinkSet
+	nilSet.recordArrFiles([]arr.ContentFile{{Path: ep}}) // must not panic
+}

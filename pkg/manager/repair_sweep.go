@@ -919,7 +919,9 @@ func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairCo
 					return err
 				}
 				r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Sweep: GetMedia failed; skipping arr")
-				dead.markIncomplete()
+				if listableArr(a) {
+					dead.markIncomplete() // a Sonarr/Radarr we could not see: dead-link data is partial
+				}
 				return nil
 			}
 			mu.Lock()
@@ -957,6 +959,7 @@ func (r *Repair) collectArrMediaCandidatesWithDead(ctx context.Context, a *arr.A
 			return out, ctx.Err()
 		default:
 		}
+		dead.recordArrFiles(content.Files)
 		for entryPath, files := range collectArrFiles(content) {
 			name := filepath.Clean(filepath.Base(entryPath))
 			item, err := r.manager.GetEntryItem(name)

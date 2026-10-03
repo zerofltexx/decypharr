@@ -139,7 +139,7 @@ When an Arr upgrades or deletes a file it removes the symlink, but the entry it 
 | `library_paths` | Folders holding your Arrs' symlinks. Each must exist and contain symlinks, or the pass aborts.            | —                  |
 | `min_age`       | How long an entry must have been complete or imported before it can be reclaimed.                         | `24h`              |
 | `max_per_run`   | If more entries than this would be removed, the pass aborts and removes nothing.                          | `200`              |
-| `categories`    | Categories in scope.                                                                                      | every Arr's name   |
+| `categories`    | Categories in scope. The default covers only the Sonarr/Radarr instances the sweep scans (`repair.arrs`); make sure `library_paths` holds their libraries. | swept Sonarr/Radarr |
 
 How it decides:
 
