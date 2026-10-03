@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +85,16 @@ type ReclaimReport struct {
 	DeadLinksRepaired int        `json:"dead_links_repaired"`
 	DeadLinksFailed   int        `json:"dead_links_failed"`
 
+	// Orphan links: broken symlinks into the mount that no Arr has a file
+	// record for (the Arr already marked the media missing). The link is
+	// removed and the owning Arr asked to search for the movie/season.
+	OrphanLinks    []OrphanLink `json:"orphan_links"`
+	OrphansAborted string       `json:"orphans_aborted,omitempty"`
+	OrphansRemoved int          `json:"orphans_removed"`
+	OrphanSearches int          `json:"orphan_searches"`
+
+	orphans []libLink // candidates from the library walk
+
 	Reclaimable      []ReclaimItem  `json:"reclaimable"`
 	ReclaimableBytes int64          `json:"reclaimable_bytes"`
 	ByCategory       map[string]int `json:"by_category"`
@@ -98,6 +110,20 @@ type reclaimState struct {
 	mu      sync.RWMutex
 	last    *ReclaimReport
 	dead    *deadLinkSet // from the most recent Arr-source sweep
+}
+
+// OrphanLink is a broken library symlink no Arr has a file record for.
+type OrphanLink struct {
+	Path    string `json:"path"`
+	Target  string `json:"target"`
+	Arr     string `json:"arr,omitempty"`      // owning Arr, if its folder is known
+	MediaID int    `json:"media_id,omitempty"` // series or movie id in that Arr
+	Season  int    `json:"season,omitempty"`
+}
+
+// libLink is one library symlink whose target lies inside the mount.
+type libLink struct {
+	path, target, folder string
 }
 
 // DeadLink is one Arr file whose symlink target entry is gone.
@@ -199,7 +225,9 @@ func (r *Repair) RunReclaim(ctx context.Context, dryRun bool) (*ReclaimReport, e
 	cfg := r.cfg().Reclaim
 	dry := dryRun || !cfg.Delete
 	report := r.runReclaim(ctx, cfg, r.reclaimCategories(cfg), dry)
-	r.repairDeadLinks(ctx, cfg, report, dry)
+	d := r.takeDeadLinks(dry)
+	r.repairDeadLinks(ctx, cfg, report, dry, d)
+	r.handleOrphans(ctx, cfg, report, dry, d)
 
 	r.reclaim.mu.Lock()
 	r.reclaim.last = report
@@ -263,10 +291,11 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 		return abort("invalid min_age %q", cfg.MinAge)
 	}
 
-	linked, symlinks, err := collectLinkedFolders(ctx, cfg.LibraryPaths)
+	linked, symlinks, links, err := collectLinkedFolders(ctx, cfg.LibraryPaths, filepath.Clean(config.Get().Mount.MountPath))
 	if err != nil {
 		return abort("%v", err)
 	}
+	report.orphans = orphanCandidates(links, r.manager.storage.GetEntryItems())
 	report.Symlinks = symlinks
 	report.LinkedFolders = len(linked)
 
@@ -368,16 +397,22 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 	return report
 }
 
+// takeDeadLinks returns the last sweep's dead-link set; a deleting run
+// consumes it so a set is acted on at most once.
+func (r *Repair) takeDeadLinks(dryRun bool) *deadLinkSet {
+	r.reclaim.mu.Lock()
+	defer r.reclaim.mu.Unlock()
+	d := r.reclaim.dead
+	if !dryRun {
+		r.reclaim.dead = nil
+	}
+	return d
+}
+
 // repairDeadLinks acts on the dead links the last sweep found: each Arr's
 // file records are deleted and the media re-acquired. A partial Arr listing,
 // a stale set, or more than MaxPerRun links skips the step.
-func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool) {
-	r.reclaim.mu.Lock()
-	d := r.reclaim.dead
-	if !dryRun {
-		r.reclaim.dead = nil // act on a set at most once
-	}
-	r.reclaim.mu.Unlock()
+func (r *Repair) repairDeadLinks(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet) {
 	if d == nil {
 		return
 	}
@@ -546,20 +581,24 @@ func lastActivity(e *storage.Entry) time.Time {
 // directory), plus the number of symlinks seen. It fails if a path is missing
 // or unreadable, or if no symlinks are found at all, since either would make
 // every entry look unreferenced.
-func collectLinkedFolders(ctx context.Context, roots []string) (map[string]struct{}, int, error) {
+//
+// It also returns every link whose target lies under mountRoot (when set), for
+// orphan detection.
+func collectLinkedFolders(ctx context.Context, roots []string, mountRoot string) (map[string]struct{}, int, []libLink, error) {
 	if len(roots) == 0 {
-		return nil, 0, errors.New("no library_paths configured")
+		return nil, 0, nil, errors.New("no library_paths configured")
 	}
 	linked := make(map[string]struct{})
+	var links []libLink
 	total := 0
 	for _, root := range roots {
 		root = filepath.Clean(root)
 		info, err := os.Stat(root)
 		if err != nil {
-			return nil, 0, fmt.Errorf("library path %s: %w", root, err)
+			return nil, 0, nil, fmt.Errorf("library path %s: %w", root, err)
 		}
 		if !info.IsDir() {
-			return nil, 0, fmt.Errorf("library path %s is not a directory", root)
+			return nil, 0, nil, fmt.Errorf("library path %s is not a directory", root)
 		}
 		n := 0
 		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -579,20 +618,197 @@ func collectLinkedFolders(ctx context.Context, roots []string) (map[string]struc
 			if !filepath.IsAbs(target) {
 				target = filepath.Join(filepath.Dir(path), target)
 			}
-			folder := filepath.Base(filepath.Dir(filepath.Clean(target)))
+			target = filepath.Clean(target)
+			folder := filepath.Base(filepath.Dir(target))
 			if folder != "." && folder != string(filepath.Separator) {
 				linked[folder] = struct{}{}
+				if mountRoot != "" && mountRoot != "." && isUnder(target, mountRoot) {
+					links = append(links, libLink{path: filepath.Clean(path), target: target, folder: folder})
+				}
 			}
 			n++
 			return nil
 		})
 		if err != nil {
-			return nil, 0, fmt.Errorf("walking %s: %w", root, err)
+			return nil, 0, nil, fmt.Errorf("walking %s: %w", root, err)
 		}
 		if n == 0 {
-			return nil, 0, fmt.Errorf("library path %s contains no symlinks", root)
+			return nil, 0, nil, fmt.Errorf("library path %s contains no symlinks", root)
 		}
 		total += n
 	}
-	return linked, total, nil
+	return linked, total, links, nil
+}
+
+var (
+	seasonDirRE     = regexp.MustCompile(`(?i)^season[ ._-]*(\d+)$`)
+	seasonEpisodeRE = regexp.MustCompile(`(?i)\bS(\d{1,3})E\d{1,4}`)
+)
+
+// orphanCandidates keeps the links whose target folder is not an entry in
+// the store. An empty store yields nothing: it would make every link look
+// broken.
+func orphanCandidates(links []libLink, known map[string]struct{}) []libLink {
+	if len(known) == 0 {
+		return nil
+	}
+	var out []libLink
+	for _, l := range links {
+		if _, ok := known[l.folder]; !ok {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// mediaOwner walks up from a library file to the first folder an Arr knows.
+func mediaOwner(path string, folders map[string]int) (int, bool) {
+	dir := filepath.Dir(filepath.Clean(path))
+	for i := 0; i < 4; i++ {
+		if id, ok := folders[dir]; ok {
+			return id, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return 0, false
+}
+
+// seasonOf reads the season from a "Season NN" folder or an SxxEyy name.
+func seasonOf(path string) (int, bool) {
+	if m := seasonDirRE.FindStringSubmatch(filepath.Base(filepath.Dir(path))); m != nil {
+		n, err := strconv.Atoi(m[1])
+		return n, err == nil
+	}
+	if m := seasonEpisodeRE.FindStringSubmatch(filepath.Base(path)); m != nil {
+		n, err := strconv.Atoi(m[1])
+		return n, err == nil
+	}
+	return 0, false
+}
+
+// handleOrphans removes broken library links no Arr tracks and asks the owning
+// Arr to search for the movie or season, so the media is re-acquired instead
+// of staying missing. Links the dead-link step owns are excluded. It needs the
+// same fresh, complete sweep as dead-link repair, and honours MaxPerRun.
+func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet) {
+	report.OrphanLinks = []OrphanLink{}
+	if len(report.orphans) == 0 {
+		return
+	}
+	log := r.logger.With().Str("pass", "reclaim").Logger()
+	switch {
+	case d == nil:
+		report.OrphansAborted = "no Arr-source sweep since start; orphans are handled right after one"
+	case d.incomplete:
+		report.OrphansAborted = "an Arr listing failed during the sweep"
+	case time.Since(d.collected) > deadLinkMaxAge:
+		report.OrphansAborted = "sweep data is older than " + deadLinkMaxAge.String()
+	}
+
+	owned := make(map[string]struct{})
+	if d != nil {
+		d.mu.Lock()
+		for _, g := range d.byArr {
+			for _, l := range g.links {
+				owned[filepath.Clean(l.Path)] = struct{}{}
+			}
+		}
+		d.mu.Unlock()
+	}
+
+	type owner struct {
+		a       *arr.Arr
+		folders map[string]int
+	}
+	var owners []owner
+	if report.OrphansAborted == "" {
+		for _, a := range r.eligibleArrs(r.cfg().Arrs) {
+			folders, err := a.MediaFolders(ctx)
+			if err != nil {
+				report.OrphansAborted = fmt.Sprintf("listing %s media folders: %v", a.Name, err)
+				break
+			}
+			owners = append(owners, owner{a, folders})
+		}
+	}
+
+	for _, l := range report.orphans {
+		if _, ok := owned[l.path]; ok {
+			continue
+		}
+		o := OrphanLink{Path: l.path, Target: l.target}
+		for _, ow := range owners {
+			if id, ok := mediaOwner(l.path, ow.folders); ok {
+				o.Arr, o.MediaID = ow.a.Name, id
+				o.Season, _ = seasonOf(l.path)
+				break
+			}
+		}
+		report.OrphanLinks = append(report.OrphanLinks, o)
+	}
+	if report.OrphansAborted == "" && len(report.OrphanLinks) > cfg.MaxPerRun {
+		report.OrphansAborted = fmt.Sprintf("%d orphan links exceeds max_per_run %d", len(report.OrphanLinks), cfg.MaxPerRun)
+	}
+	if report.OrphansAborted != "" {
+		if len(report.OrphanLinks) > 0 {
+			log.Warn().Str("reason", report.OrphansAborted).Int("orphans", len(report.OrphanLinks)).Msg("Reclaim: orphan links skipped")
+		}
+		return
+	}
+	if dryRun {
+		for _, o := range report.OrphanLinks {
+			log.Info().Str("path", o.Path).Str("arr", o.Arr).Msg("Reclaim: would remove orphan link and search")
+		}
+		return
+	}
+
+	searches := make(map[*arr.Arr][]arr.ContentFile)
+	seen := make(map[string]struct{})
+	for _, o := range report.OrphanLinks {
+		if ctx.Err() != nil {
+			return
+		}
+		// Re-check just before acting: same target, entry still missing.
+		target := readSymlinkTarget(o.Path)
+		if target == "" || filepath.Clean(target) != o.Target {
+			continue
+		}
+		if item, err := r.manager.GetEntryItem(filepath.Base(filepath.Dir(o.Target))); err == nil && item != nil {
+			continue
+		}
+		if err := os.Remove(o.Path); err != nil {
+			log.Warn().Err(err).Str("path", o.Path).Msg("Reclaim: orphan link remove failed")
+			continue
+		}
+		report.OrphansRemoved++
+		if o.Arr == "" {
+			continue
+		}
+		for _, ow := range owners {
+			if ow.a.Name != o.Arr {
+				continue
+			}
+			if ow.a.Type == arr.Sonarr && o.Season == 0 {
+				break // season unknown: a SeasonSearch for specials would be wrong
+			}
+			key := fmt.Sprintf("%s/%d/%d", o.Arr, o.MediaID, o.Season)
+			if _, dup := seen[key]; !dup {
+				seen[key] = struct{}{}
+				searches[ow.a] = append(searches[ow.a], arr.ContentFile{Id: o.MediaID, SeasonNumber: o.Season})
+			}
+			break
+		}
+	}
+	for a, files := range searches {
+		if err := a.SearchMissing(ctx, files); err != nil {
+			log.Warn().Err(err).Str("arr", a.Name).Msg("Reclaim: orphan search failed")
+			continue
+		}
+		report.OrphanSearches += len(files)
+	}
+	log.Info().Int("removed", report.OrphansRemoved).Int("searches", report.OrphanSearches).Msg("Reclaim: orphan links handled")
 }

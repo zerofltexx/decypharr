@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -325,4 +326,39 @@ func (a *Arr) batchDeleteFiles(ctx context.Context, files []ContentFile) error {
 		return fmt.Errorf("unknown arr type: %s", a.Type)
 	}
 	return nil
+}
+
+// MediaFolders maps each series (Sonarr) or movie (Radarr) folder to its id,
+// so a library path can be traced back to the media that owns it even when
+// the Arr no longer has a file record for it.
+func (a *Arr) MediaFolders(ctx context.Context) (map[string]int, error) {
+	type media struct {
+		Id   int    `json:"id"`
+		Path string `json:"path"`
+	}
+	var data []media
+	endpoint := "api/v3/series"
+	if a.Type == Radarr {
+		endpoint = "api/v3/movie"
+	}
+	resp, err := a.RequestCtx(ctx, http.MethodGet, endpoint, nil, &data)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound && a.Type != Radarr {
+		data = nil
+		if resp, err = a.RequestCtx(ctx, http.MethodGet, "api/v3/movie", nil, &data); err != nil {
+			return nil, err
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to list media folders: %s", resp.Status)
+	}
+	out := make(map[string]int, len(data))
+	for _, m := range data {
+		if m.Path != "" {
+			out[filepath.Clean(m.Path)] = m.Id
+		}
+	}
+	return out, nil
 }

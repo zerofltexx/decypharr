@@ -45,7 +45,7 @@ func TestCollectLinkedFolders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	linked, n, err := collectLinkedFolders(context.Background(), []string{lib})
+	linked, n, links, err := collectLinkedFolders(context.Background(), []string{lib}, mount)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,18 +60,21 @@ func TestCollectLinkedFolders(t *testing.T) {
 	if len(linked) != 3 {
 		t.Errorf("linked = %v, want 3 folders", linked)
 	}
+	if len(links) != 3 {
+		t.Errorf("links into the mount = %d, want 3", len(links))
+	}
 }
 
 func TestCollectLinkedFoldersFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	if _, _, err := collectLinkedFolders(ctx, nil); err == nil {
+	if _, _, _, err := collectLinkedFolders(ctx, nil, ""); err == nil {
 		t.Error("no paths: want error")
 	}
-	if _, _, err := collectLinkedFolders(ctx, []string{filepath.Join(t.TempDir(), "missing")}); err == nil {
+	if _, _, _, err := collectLinkedFolders(ctx, []string{filepath.Join(t.TempDir(), "missing")}, ""); err == nil {
 		t.Error("missing path: want error")
 	}
 	// An empty or unmounted library must never make everything look unreferenced.
-	if _, _, err := collectLinkedFolders(ctx, []string{t.TempDir()}); err == nil {
+	if _, _, _, err := collectLinkedFolders(ctx, []string{t.TempDir()}, ""); err == nil {
 		t.Error("path without symlinks: want error")
 	}
 }
@@ -165,4 +168,51 @@ func TestDeadLinkSetAdd(t *testing.T) {
 	}
 	var nilSet *deadLinkSet
 	nilSet.add(a, entry(mount, "gone"), "gone", f) // must not panic
+}
+
+func TestOrphanCandidates(t *testing.T) {
+	links := []libLink{{path: "a", folder: "live"}, {path: "b", folder: "gone"}}
+	got := orphanCandidates(links, map[string]struct{}{"live": {}})
+	if len(got) != 1 || got[0].path != "b" {
+		t.Fatalf("got %+v, want only the link to the missing entry", got)
+	}
+	if got := orphanCandidates(links, map[string]struct{}{}); got != nil {
+		t.Fatal("an empty store must never yield orphans")
+	}
+}
+
+func TestMediaOwner(t *testing.T) {
+	base := t.TempDir()
+	show := filepath.Join(base, "tv", "Show (2020)")
+	movie := filepath.Join(base, "movies", "Movie (2020)")
+	folders := map[string]int{show: 7, movie: 9}
+
+	if id, ok := mediaOwner(filepath.Join(show, "Season 02", "Show - S02E03.mkv"), folders); !ok || id != 7 {
+		t.Errorf("episode owner = %d, %v; want 7", id, ok)
+	}
+	if id, ok := mediaOwner(filepath.Join(movie, "Movie (2020).mkv"), folders); !ok || id != 9 {
+		t.Errorf("movie owner = %d, %v; want 9", id, ok)
+	}
+	if _, ok := mediaOwner(filepath.Join(base, "tv", "Other", "x.mkv"), folders); ok {
+		t.Error("unknown folder must have no owner")
+	}
+}
+
+func TestSeasonOf(t *testing.T) {
+	base := t.TempDir()
+	cases := []struct {
+		path string
+		want int
+		ok   bool
+	}{
+		{filepath.Join(base, "Show", "Season 04", "x.mkv"), 4, true},
+		{filepath.Join(base, "Show", "Season.12", "x.mkv"), 12, true},
+		{filepath.Join(base, "Show", "Show.S03E10.1080p.mkv"), 3, true},
+		{filepath.Join(base, "Movie (2020)", "Movie (2020).mkv"), 0, false},
+	}
+	for _, c := range cases {
+		if got, ok := seasonOf(c.path); got != c.want || ok != c.ok {
+			t.Errorf("seasonOf(%s) = %d, %v; want %d, %v", filepath.Base(c.path), got, ok, c.want, c.ok)
+		}
+	}
 }
