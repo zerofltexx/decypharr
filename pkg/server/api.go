@@ -504,8 +504,13 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Decode the incoming config update
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var newConfig config.Config
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+	if err := json.ConfigDefault.Unmarshal(body, &newConfig); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to decode config update request")
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
@@ -528,8 +533,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
 	// The settings page does not edit repair.reclaim; keep the stored one when
-	// the payload omits it, or any unrelated save would switch reclaim off.
-	if newConfig.Repair.Reclaim.IsZero() {
+	// the payload omits the key, or any unrelated save would switch reclaim off.
+	// An explicit "reclaim" (even all-false, to disable it) is honoured.
+	if !jsonHasKey(body, "repair", "reclaim") {
 		newConfig.Repair.Reclaim = currentConfig.Repair.Reclaim
 	}
 	// The frontend config form doesn't include use_auth or enable_webdav_auth,
@@ -609,13 +615,37 @@ func (s *Server) handlePreviewVirtualFolder(w http.ResponseWriter, r *http.Reque
 	}, http.StatusOK)
 }
 
+// jsonHasKey reports whether the JSON object in body has the nested key path.
+// Used to tell an omitted field from one sent with zero values.
+func jsonHasKey(body []byte, path ...string) bool {
+	var cur any
+	if err := json.ConfigDefault.Unmarshal(body, &cur); err != nil {
+		return false
+	}
+	for _, k := range path {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		if cur, ok = obj[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, config.Get().Repair, http.StatusOK)
 }
 
 func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var req config.RepairConfig
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.ConfigDefault.Unmarshal(body, &req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -646,9 +676,9 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	cfg := config.Get()
-	// Keep the stored reclaim settings when the request omits them, as the
-	// full-config save does.
-	if req.Reclaim.IsZero() {
+	// Keep the stored reclaim settings when the request omits the key, as the
+	// full-config save does; an explicit "reclaim" is honoured.
+	if !jsonHasKey(body, "reclaim") {
 		req.Reclaim = cfg.Repair.Reclaim
 	}
 	cfg.Repair = req

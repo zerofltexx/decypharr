@@ -268,8 +268,9 @@ type ReclaimConfig struct {
 	// would be removed. A sudden spike usually means a library path is wrong.
 	MaxPerRun int `json:"max_per_run,omitempty"`
 
-	// Categories limits the pass to these categories. Empty means every
-	// configured Arr's name.
+	// Categories limits the pass to these categories. Empty means the
+	// Sonarr/Radarr Arrs listed in repair.arrs; with neither set, unreferenced
+	// entries are not reclaimed (dead-link repair still runs).
 	Categories []string `json:"categories,omitempty"`
 }
 

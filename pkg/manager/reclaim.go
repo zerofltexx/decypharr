@@ -576,12 +576,14 @@ func (r *Repair) reclaimEntry(infoHash string) error {
 	return r.manager.storage.Delete(infoHash)
 }
 
-// alreadyGone reports a provider delete that failed with HTTP 404 because the
-// torrent no longer exists there, which is the outcome reclaim wanted. Other
-// errors (including other "not found" wordings) stay failures, so a store
-// entry is never dropped while its torrent may still be on the account.
+// alreadyGone reports a delete that failed because the item no longer exists
+// (a debrid provider's HTTP 404, or usenet's "nzb not found"), which is the
+// outcome reclaim wanted. Other errors stay failures, so a store entry is
+// never dropped while its torrent may still be on the account.
 func alreadyGone(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "status: 404")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "status: 404") || // debrid providers' HTTP 404
+		strings.Contains(msg, "nzb not found") // usenet: NZB metadata already gone
 }
 
 type reclaimVerdict int
@@ -764,6 +766,10 @@ func seasonOf(path string) (int, bool) {
 // same fresh, complete sweep as dead-link repair, and honours MaxPerRun.
 func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, report *ReclaimReport, dryRun bool, d *deadLinkSet, afterSweep bool) {
 	report.OrphanLinks = []OrphanLink{}
+	if report.Aborted != "" && report.Symlinks == 0 {
+		report.OrphansAborted = "library walk did not run: " + report.Aborted
+		return
+	}
 	if len(report.orphans) == 0 {
 		return
 	}

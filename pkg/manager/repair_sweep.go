@@ -751,10 +751,13 @@ func (r *Repair) reacquireArrFiles(ctx context.Context, a *arr.Arr, files []arr.
 	// Blocklist each unique grab. Errors here are non-fatal: a missing blocklist
 	// is bad but DeleteFiles already cleared the rows, so the fallback
 	// SearchMissing below still has a chance to recover.
+	// The file records are gone now: finish the blocklist/search even if the
+	// run is cancelled meanwhile, or the media would stay missing with nothing
+	// left for a later sweep to find.
+	if ctx != nil {
+		ctx = context.WithoutCancel(ctx)
+	}
 	for id := range historyIDs {
-		if ctx != nil && ctx.Err() != nil {
-			break
-		}
 		if err := a.MarkHistoryFailed(id); err != nil {
 			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("Repair: MarkHistoryFailed failed")
 		}

@@ -270,3 +270,9 @@ func TestAlreadyGone(t *testing.T) {
 		}
 	}
 }
+
+func TestAlreadyGoneUsenet(t *testing.T) {
+	if !alreadyGone(errors.New("failed to get NZB: nzb not found: abc")) {
+		t.Error("usenet 'nzb not found' must count as already removed")
+	}
+}
