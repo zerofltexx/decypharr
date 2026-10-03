@@ -527,6 +527,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Preserve fields that shouldn't be overwritten by frontend
 	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
+	// The settings page does not edit repair.reclaim; keep the stored one when
+	// the payload omits it, or any unrelated save would switch reclaim off.
+	if newConfig.Repair.Reclaim.IsZero() {
+		newConfig.Repair.Reclaim = currentConfig.Repair.Reclaim
+	}
 	// The frontend config form doesn't include use_auth or enable_webdav_auth,
 	// so they would be zero-valued (false) in the decoded payload. Preserve
 	// them from the live config so auth isn't silently disabled on every save.

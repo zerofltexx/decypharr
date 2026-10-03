@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -241,4 +242,31 @@ func TestRecordArrFiles(t *testing.T) {
 	}
 	var nilSet *deadLinkSet
 	nilSet.recordArrFiles([]arr.ContentFile{{Path: ep}}) // must not panic
+}
+
+func TestMayHoldLibrary(t *testing.T) {
+	for _, c := range []struct {
+		typ  arr.Type
+		want bool
+	}{{arr.Sonarr, true}, {arr.Radarr, true}, {arr.Others, true}, {arr.Lidarr, false}, {arr.Readarr, false}} {
+		if got := mayHoldLibrary(&arr.Arr{Type: c.typ}); got != c.want {
+			t.Errorf("mayHoldLibrary(%s) = %v, want %v", c.typ, got, c.want)
+		}
+	}
+}
+
+func TestAlreadyGone(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want bool
+	}{
+		{"realdebrid API error: Status: 404", true},
+		{"torrent not found", true},
+		{"realdebrid API error: Status: 503", false},
+		{"context deadline exceeded", false},
+	} {
+		if got := alreadyGone(errors.New(c.msg)); got != c.want {
+			t.Errorf("alreadyGone(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
 }

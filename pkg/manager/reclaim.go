@@ -91,6 +91,7 @@ type ReclaimReport struct {
 	OrphanLinks    []OrphanLink `json:"orphan_links"`
 	OrphansAborted string       `json:"orphans_aborted,omitempty"`
 	OrphansRemoved int          `json:"orphans_removed"`
+	OrphansSkipped int          `json:"orphans_skipped"` // no owner, unknown season, or still tracked
 	OrphanSearches int          `json:"orphan_searches"`
 
 	orphans []libLink // candidates from the library walk
@@ -162,6 +163,13 @@ func newDeadLinkSet(known map[string]struct{}) *deadLinkSet {
 		byArr:     make(map[string]*deadArrFiles),
 		arrPaths:  make(map[string]struct{}),
 	}
+}
+
+// mayHoldLibrary reports whether a failed listing of this Arr leaves the
+// dead-link data incomplete. Only types that are never listed are exempt; an
+// Arr whose type is still a guess (Others) counts.
+func mayHoldLibrary(a *arr.Arr) bool {
+	return a != nil && a.Type != arr.Lidarr && a.Type != arr.Readarr
 }
 
 // listableArr reports whether the Arr's media can be enumerated (GetMedia and
@@ -266,8 +274,14 @@ func (r *Repair) reclaimPass(ctx context.Context, dryRun, afterSweep bool) *Recl
 }
 
 // reclaimAfterSweep is called once a scheduled sweep has completed.
-func (r *Repair) reclaimAfterSweep(ctx context.Context) {
+func (r *Repair) reclaimAfterSweep(ctx context.Context, autoRepair bool) {
 	if !r.cfg().Reclaim.Enabled {
+		return
+	}
+	if !autoRepair {
+		// A sweep run with auto-repair off is a pure health check: it must not
+		// delete debrid entries or touch Arr records.
+		r.logger.Info().Msg("Reclaim: skipped (sweep ran without auto-repair)")
 		return
 	}
 	if !r.reclaim.running.TryLock() {
@@ -552,11 +566,19 @@ func (r *Repair) reclaimEntry(infoHash string) error {
 	// the store entry while the torrent survives on the account would leak it
 	// (the account sync re-adds it without a category, out of reclaim's scope).
 	for _, placement := range e.Providers {
-		if err := r.manager.RemoveFromProvider(placement); err != nil {
+		if err := r.manager.RemoveFromProvider(placement); err != nil && !alreadyGone(err) {
 			return fmt.Errorf("remove from %s: %w", placement.Provider, err)
 		}
 	}
 	return r.manager.storage.Delete(infoHash)
+}
+
+// alreadyGone reports a provider delete that failed because the torrent no
+// longer exists there (e.g. Real-Debrid answers 404), which is the outcome
+// reclaim wanted.
+func alreadyGone(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "status: 404") || strings.Contains(msg, "not found")
 }
 
 type reclaimVerdict int
@@ -814,9 +836,45 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 
 	searches := make(map[*arr.Arr][]arr.ContentFile)
 	seen := make(map[string]struct{})
+	tracked := make(map[string]map[string]struct{}) // "arr/mediaID" -> paths the Arr has records for
 	for _, o := range report.OrphanLinks {
 		if ctx.Err() != nil {
 			return
+		}
+		// Only act when an owning Arr is known and can re-acquire the media;
+		// anything else stays report-only (the link may belong to an Arr the
+		// sweep does not scan).
+		var owner *arr.Arr
+		for _, ow := range owners {
+			if ow.a.Name == o.Arr {
+				owner = ow.a
+				break
+			}
+		}
+		if owner == nil || (owner.Type == arr.Sonarr && o.Season == 0) {
+			report.OrphansSkipped++
+			continue
+		}
+		// Ask the Arr directly: if it still has a file record for this path,
+		// it is a dead link for the next sweep to repair, not an orphan.
+		key := fmt.Sprintf("%s/%d", owner.Name, o.MediaID)
+		paths, ok := tracked[key]
+		if !ok {
+			list, err := owner.FilePaths(ctx, o.MediaID)
+			if err != nil {
+				log.Warn().Err(err).Str("arr", owner.Name).Int("media_id", o.MediaID).Msg("Reclaim: cannot confirm orphan, skipping")
+				report.OrphansSkipped++
+				continue
+			}
+			paths = make(map[string]struct{}, len(list))
+			for _, p := range list {
+				paths[p] = struct{}{}
+			}
+			tracked[key] = paths
+		}
+		if _, isTracked := paths[o.Path]; isTracked {
+			report.OrphansSkipped++
+			continue
 		}
 		// Re-check just before acting: same target, entry still missing.
 		target := readSymlinkTarget(o.Path)
@@ -831,22 +889,10 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 			continue
 		}
 		report.OrphansRemoved++
-		if o.Arr == "" {
-			continue
-		}
-		for _, ow := range owners {
-			if ow.a.Name != o.Arr {
-				continue
-			}
-			if ow.a.Type == arr.Sonarr && o.Season == 0 {
-				break // season unknown: a SeasonSearch for specials would be wrong
-			}
-			key := fmt.Sprintf("%s/%d/%d", o.Arr, o.MediaID, o.Season)
-			if _, dup := seen[key]; !dup {
-				seen[key] = struct{}{}
-				searches[ow.a] = append(searches[ow.a], arr.ContentFile{Id: o.MediaID, SeasonNumber: o.Season})
-			}
-			break
+		sk := fmt.Sprintf("%s/%d/%d", owner.Name, o.MediaID, o.Season)
+		if _, dup := seen[sk]; !dup {
+			seen[sk] = struct{}{}
+			searches[owner] = append(searches[owner], arr.ContentFile{Id: o.MediaID, SeasonNumber: o.Season})
 		}
 	}
 	for a, files := range searches {

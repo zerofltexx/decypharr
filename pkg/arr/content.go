@@ -362,3 +362,34 @@ func (a *Arr) MediaFolders(ctx context.Context) (map[string]int, error) {
 	}
 	return out, nil
 }
+
+// FilePaths returns the library paths the Arr has file records for under one
+// series (Sonarr) or movie (Radarr).
+func (a *Arr) FilePaths(ctx context.Context, mediaID int) ([]string, error) {
+	var endpoint string
+	switch a.Type {
+	case Sonarr:
+		endpoint = fmt.Sprintf("api/v3/episodefile?seriesId=%d", mediaID)
+	case Radarr:
+		endpoint = fmt.Sprintf("api/v3/moviefile?movieId=%d", mediaID)
+	default:
+		return nil, fmt.Errorf("file listing not supported for arr type %q", a.Type)
+	}
+	var files []struct {
+		Path string `json:"path"`
+	}
+	resp, err := a.RequestCtx(ctx, http.MethodGet, endpoint, nil, &files)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to list files: %s", resp.Status)
+	}
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.Path != "" {
+			out = append(out, filepath.Clean(f.Path))
+		}
+	}
+	return out, nil
+}

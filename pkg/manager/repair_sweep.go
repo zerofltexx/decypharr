@@ -162,7 +162,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("repair_failed", run.Stats.RepairFailed).
 		Msg("Sweep: completed")
 
-	r.reclaimAfterSweep(ctx)
+	r.reclaimAfterSweep(ctx, autoRepair)
 }
 
 // finishCancelledRepairSweep is reached whenever the repair sweep's context is cancelled
@@ -817,6 +817,7 @@ func (r *Repair) finalizeEntryRepair(name string, h *storage.EntryHealth, succee
 
 func (r *Repair) enumerateCandidates(ctx context.Context, cfg config.RepairConfig) (map[string]*candidate, error) {
 	if cfg.Source == config.RepairSourceManaged {
+		r.setDeadLinks(nil) // no Arr data this sweep: never act on an older set
 		return r.enumerateManagedCandidates(ctx)
 	}
 	return r.enumerateArrCandidates(ctx, cfg)
@@ -919,8 +920,8 @@ func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairCo
 					return err
 				}
 				r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Sweep: GetMedia failed; skipping arr")
-				if listableArr(a) {
-					dead.markIncomplete() // a Sonarr/Radarr we could not see: dead-link data is partial
+				if mayHoldLibrary(a) {
+					dead.markIncomplete() // an Arr we could not see: dead-link data is partial
 				}
 				return nil
 			}
