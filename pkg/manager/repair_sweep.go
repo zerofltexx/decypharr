@@ -908,6 +908,7 @@ func (r *Repair) enumerateArrCandidates(ctx context.Context, cfg config.RepairCo
 
 	arrs := r.eligibleArrs(cfg.Arrs)
 	if len(arrs) == 0 {
+		r.setDeadLinks(nil) // no Arr data this sweep: never act on an older set
 		return out, nil
 	}
 

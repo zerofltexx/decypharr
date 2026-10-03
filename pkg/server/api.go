@@ -646,6 +646,11 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	cfg := config.Get()
+	// Keep the stored reclaim settings when the request omits them, as the
+	// full-config save does.
+	if req.Reclaim.IsZero() {
+		req.Reclaim = cfg.Repair.Reclaim
+	}
 	cfg.Repair = req
 	if err := cfg.Save(); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save repair config")

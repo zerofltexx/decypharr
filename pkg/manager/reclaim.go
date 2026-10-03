@@ -297,12 +297,15 @@ func (r *Repair) reclaimCategories(cfg config.ReclaimConfig) []string {
 	if len(cfg.Categories) > 0 {
 		names = cfg.Categories
 	} else {
-		// Default to the Arrs the repair sweep scans (Sonarr/Radarr only). Every
-		// other configured Arr (e.g. Lidarr) keeps its library elsewhere, outside
-		// library_paths, so its entries would all look unreferenced.
-		for _, a := range r.eligibleArrs(r.cfg().Arrs) {
-			if listableArr(a) {
-				names = append(names, a.Name)
+		// Default to the Sonarr/Radarr Arrs explicitly listed in repair.arrs.
+		// Without that list there is no safe default: "every Arr" would include
+		// ones whose libraries sit outside library_paths (Lidarr, Whisparr...),
+		// and a type can change at runtime once GetMedia probes it.
+		if repairArrs := r.cfg().Arrs; len(repairArrs) > 0 {
+			for _, a := range r.eligibleArrs(repairArrs) {
+				if listableArr(a) {
+					names = append(names, a.Name)
+				}
 			}
 		}
 	}
@@ -334,7 +337,7 @@ func (r *Repair) runReclaim(ctx context.Context, cfg config.ReclaimConfig, categ
 	}
 
 	if len(categories) == 0 {
-		return abort("no categories in scope")
+		return abort("no categories in scope: set reclaim.categories or repair.arrs")
 	}
 	minAge, err := time.ParseDuration(cfg.MinAge)
 	if err != nil || minAge < 0 {
@@ -573,12 +576,12 @@ func (r *Repair) reclaimEntry(infoHash string) error {
 	return r.manager.storage.Delete(infoHash)
 }
 
-// alreadyGone reports a provider delete that failed because the torrent no
-// longer exists there (e.g. Real-Debrid answers 404), which is the outcome
-// reclaim wanted.
+// alreadyGone reports a provider delete that failed with HTTP 404 because the
+// torrent no longer exists there, which is the outcome reclaim wanted. Other
+// errors (including other "not found" wordings) stay failures, so a store
+// entry is never dropped while its torrent may still be on the account.
 func alreadyGone(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "status: 404") || strings.Contains(msg, "not found")
+	return strings.Contains(strings.ToLower(err.Error()), "status: 404")
 }
 
 type reclaimVerdict int
@@ -839,7 +842,7 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 	tracked := make(map[string]map[string]struct{}) // "arr/mediaID" -> paths the Arr has records for
 	for _, o := range report.OrphanLinks {
 		if ctx.Err() != nil {
-			return
+			break // still search for the links already removed below
 		}
 		// Only act when an owning Arr is known and can re-acquire the media;
 		// anything else stays report-only (the link may belong to an Arr the
@@ -895,8 +898,11 @@ func (r *Repair) handleOrphans(ctx context.Context, cfg config.ReclaimConfig, re
 			searches[owner] = append(searches[owner], arr.ContentFile{Id: o.MediaID, SeasonNumber: o.Season})
 		}
 	}
+	// Detached: links removed above must get their search even if the sweep
+	// was cancelled meanwhile, or that media would stay missing.
+	searchCtx := context.WithoutCancel(ctx)
 	for a, files := range searches {
-		if err := a.SearchMissing(ctx, files); err != nil {
+		if err := a.SearchMissing(searchCtx, files); err != nil {
 			log.Warn().Err(err).Str("arr", a.Name).Msg("Reclaim: orphan search failed")
 			continue
 		}

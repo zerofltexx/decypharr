@@ -261,7 +261,7 @@ func TestAlreadyGone(t *testing.T) {
 		want bool
 	}{
 		{"realdebrid API error: Status: 404", true},
-		{"torrent not found", true},
+		{"torrent not found", false}, // only a real HTTP 404 counts
 		{"realdebrid API error: Status: 503", false},
 		{"context deadline exceeded", false},
 	} {
